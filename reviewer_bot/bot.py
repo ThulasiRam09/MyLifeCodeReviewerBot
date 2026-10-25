@@ -1,7 +1,7 @@
 """Interactive CLI: AI Code Reviewer, DSA Mentor & Interview Coach.
 
 Usage:
-    export ANTHROPIC_API_KEY=...
+    export GEMINI_API_KEY=...
     python bot.py                 # interactive chat
     python bot.py --file Sol.java # review a file, then continue chatting
     python bot.py --no-search     # disable web search
@@ -14,14 +14,11 @@ import os
 import sys
 from pathlib import Path
 
-import anthropic
+from google import genai
+from google.genai import types
 
 PROMPT_PATH = Path(__file__).with_name("system_prompt.md")
-DEFAULT_MODEL = os.environ.get("REVIEWER_MODEL", "claude-sonnet-4-5")
-MAX_TOKENS = 16000
-
-# Server-side web search, used for the company/interview research section.
-WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
+DEFAULT_MODEL = os.environ.get("REVIEWER_MODEL", "gemini-2.5-flash")
 
 
 def read_multiline() -> str | None:
@@ -42,17 +39,18 @@ def read_multiline() -> str | None:
         lines.append(line)
 
 
-def stream_reply(client, model, system, messages, tools):
-    """Stream one assistant turn, print text live, return content blocks."""
-    kwargs = dict(model=model, max_tokens=MAX_TOKENS, system=system, messages=messages)
-    if tools:
-        kwargs["tools"] = tools
-    with client.messages.stream(**kwargs) as stream:
-        for text in stream.text_stream:
-            print(text, end="", flush=True)
-        final = stream.get_final_message()
+def stream_reply(chat, text):
+    """Stream one assistant turn and print text live."""
+    for chunk in chat.send_message_stream(text):
+        if chunk.text:
+            print(chunk.text, end="", flush=True)
     print("\n")
-    return final
+
+
+def new_chat(client, model, system, search):
+    tools = [types.Tool(google_search=types.GoogleSearch())] if search else None
+    config = types.GenerateContentConfig(system_instruction=system, tools=tools)
+    return client.chats.create(model=model, config=config)
 
 
 def main() -> int:
@@ -62,14 +60,15 @@ def main() -> int:
     parser.add_argument("--no-search", action="store_true", help="disable web search")
     args = parser.parse_args()
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("Set ANTHROPIC_API_KEY first.", file=sys.stderr)
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        print("Set GEMINI_API_KEY first.", file=sys.stderr)
         return 1
 
     system = PROMPT_PATH.read_text(encoding="utf-8")
-    tools = [] if args.no_search else [WEB_SEARCH_TOOL]
-    client = anthropic.Anthropic()
-    messages: list[dict] = []
+    client = genai.Client(api_key=api_key)
+    search = not args.no_search
+    chat = new_chat(client, args.model, system, search)
 
     pending = None
     if args.file:
@@ -87,22 +86,18 @@ def main() -> int:
             if pending is None:
                 return 0
             if pending == "/reset":
-                messages.clear()
+                chat = new_chat(client, args.model, system, search)
                 print("(conversation cleared)\n")
                 pending = None
                 continue
             if not pending.strip():
                 pending = None
                 continue
-        messages.append({"role": "user", "content": pending})
-        pending = None
+        text, pending = pending, None
         try:
-            final = stream_reply(client, args.model, system, messages, tools)
-        except anthropic.APIError as e:
+            stream_reply(chat, text)
+        except Exception as e:  # API/network errors
             print(f"\nAPI error: {e}", file=sys.stderr)
-            messages.pop()
-            continue
-        messages.append({"role": "assistant", "content": final.content})
 
 
 if __name__ == "__main__":
